@@ -39,30 +39,32 @@ def precompute_freqs_cis(dim, seq_len, theta, device='cuda'):
     freqs_cos = torch.cos(freqs)  # (seq_len, dim // 2)
     freqs_sin = torch.sin(freqs)  # (seq_len, dim // 2)
 
-    # Repeat each value twice: (seq_len, dim // 2) -> (seq_len, dim)
-    freqs_cos = torch.repeat_interleave(freqs_cos, 2, dim=1)
-    freqs_sin = torch.repeat_interleave(freqs_sin, 2, dim=1)
+    # Use cat (split layout) instead of repeat_interleave for better memory coalescing
+    # Layout: [cos0, cos1, ..., cos_{d/2-1}, cos0, cos1, ..., cos_{d/2-1}]
+    # This matches mainstream implementations (HuggingFace, Flash Attention) and is GPU-friendly
+    freqs_cos = torch.cat([freqs_cos, freqs_cos], dim=-1)  # (seq_len, dim)
+    freqs_sin = torch.cat([freqs_sin, freqs_sin], dim=-1)  # (seq_len, dim)
 
     return freqs_cos, freqs_sin
 
 
 def rotate_half(x):
     """
-    Rearrange x to (-x_1, x_0, -x_3, x_2, ..., -x_{d-1}, x_{d-2})
-    This swaps and negates pairs for the rotation operation
+    Split x in half and rotate: [x1, x2] -> [-x2, x1]
+    This implements the rotation operation for RoPE using split layout (not interleaved)
 
     Args:
         x: (..., dim) where dim is even
 
     Returns:
-        rotated: (..., dim)
+        rotated: (..., dim) with layout [-x_{d/2:d}, x_{0:d/2}]
     """
-    x1 = x[..., ::2]   # Even indices: x_0, x_2, x_4, ...
-    x2 = x[..., 1::2]  # Odd indices: x_1, x_3, x_5, ...
+    # Split into two halves
+    x1 = x[..., : x.shape[-1] // 2]  # First half: x_0, x_1, ..., x_{d/2-1}
+    x2 = x[..., x.shape[-1] // 2 :]  # Second half: x_{d/2}, x_{d/2+1}, ..., x_{d-1}
 
-    # Interleave: (-x_1, x_0, -x_3, x_2, ...)
-    rotated = torch.stack([-x2, x1], dim=-1).flatten(-2)
-    return rotated
+    # Rotate: [-x2, x1]
+    return torch.cat((-x2, x1), dim=-1)
 
 
 def apply_rotary_emb(x, freqs_cos, freqs_sin):
