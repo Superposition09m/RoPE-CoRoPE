@@ -11,6 +11,7 @@ Triton: 3.5.1
 NumPy: 2.3.5
 einops: 0.8.1
 flash-attn: 2.8.3
+transformers: 4.57.3
 ```
 Install Env:
 ```bash
