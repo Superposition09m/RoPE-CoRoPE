@@ -363,10 +363,10 @@ def _attn_bwd_dkdv(dk, dv,  #
     # Extract two halves from k (already loaded tensor, not a pointer) using reshape+split
     k1, k2 = k.reshape([BLOCK_N1, 2, half_dim]).permute(0, 2, 1).split()
     
-    # Inverse RoPE: use -sin
-    k1_inv = k1 * cos_k_half - k2 * (-sin_k_half)  # = k1 * cos + k2 * sin
-    k2_inv = k2 * cos_k_half + k1 * (-sin_k_half)  # = k2 * cos - k1 * sin
-    k = tl.join(k1_inv, k2_inv).permute(0, 2, 1).reshape([BLOCK_N1, HEAD_DIM]).to(tl.float16)
+    # Forward RoPE: use +sin (reconstruct rotated K for recomputation)
+    k1_rot = k1 * cos_k_half - k2 * sin_k_half
+    k2_rot = k2 * cos_k_half + k1 * sin_k_half
+    k = tl.join(k1_rot, k2_rot).permute(0, 2, 1).reshape([BLOCK_N1, HEAD_DIM]).to(tl.float16)
 
     qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_k[:, None] * stride_d
     do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
@@ -389,22 +389,22 @@ def _attn_bwd_dkdv(dk, dv,  #
         q1 = tl.load(q1_ptrs)
         q2 = tl.load(q2_ptrs)
         
-        # Inverse RoPE: use -sin
-        q1_inv = q1 * cos_q_half - q2 * (-sin_q_half)
-        q2_inv = q2 * cos_q_half + q1 * (-sin_q_half)
-        qT = tl.join(q1_inv, q2_inv).permute(0, 2, 1).reshape([BLOCK_M1, HEAD_DIM])
+        # Forward RoPE: use +sin (reconstruct rotated Q for recomputation)
+        q1_rot = q1 * cos_q_half - q2 * sin_q_half
+        q2_rot = q2 * cos_q_half + q1 * sin_q_half
+        qT = tl.join(q1_rot, q2_rot).permute(0, 2, 1).reshape([BLOCK_M1, HEAD_DIM])
 
         # Transpose to [HEAD_DIM, BLOCK_M1] and convert back to float16
         qT = tl.trans(qT).to(tl.float16)
 
         # Load m before computing qk to reduce pipeline stall.
-        offs_m = curr_m + tl.arange(0, BLOCK_M1)
-        m = tl.load(M + offs_m)
+        offs_m_load = curr_m + tl.arange(0, BLOCK_M1)
+        m = tl.load(M + offs_m_load)
         qkT = tl.dot(k, qT)
         pT = tl.math.exp2(qkT - m[None, :])
         # Autoregressive masking.
         if MASK:
-            mask = (offs_m[None, :] >= offs_n[:, None])
+            mask = (offs_m_load[None, :] >= offs_n[:, None])
             pT = tl.where(mask, pT, 0.0)
         do = tl.load(do_ptrs)
         # Compute dV.
@@ -412,7 +412,7 @@ def _attn_bwd_dkdv(dk, dv,  #
         ppT = ppT.to(tl.float16)
         dv += tl.dot(ppT, do)
         # D (= delta) is pre-divided by ds_scale.
-        Di = tl.load(D + offs_m)
+        Di = tl.load(D + offs_m_load)
         # Compute dP and dS.
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
         dsT = pT * (dpT - Di[None, :])
@@ -423,15 +423,7 @@ def _attn_bwd_dkdv(dk, dv,  #
         qT_ptrs += step_m * stride_tok
         do_ptrs += step_m * stride_tok
 
-    # Apply INVERSE RoPE to dK before returning
-    # Mathematical reason: dL/dK_original = R^T(θ) @ dL/dK_rotated = R(-θ) @ dL/dK_rotated
-    # Extract two halves from dk (local accumulator) using reshape+split
-    dk1, dk2 = dk.reshape([BLOCK_N1, 2, half_dim]).permute(0, 2, 1).split()
-    # Inverse RoPE: use -sin
-    dk1_inv = dk1 * cos_k_half - dk2 * (-sin_k_half)
-    dk2_inv = dk2 * cos_k_half + dk1 * (-sin_k_half)
-    dk = tl.join(dk1_inv, dk2_inv).permute(0, 2, 1).reshape([BLOCK_N1, HEAD_DIM])
-
+    # Return dk and dv in rotated space (Inverse RoPE will be applied in wrapper)
     return dk, dv
 
 
@@ -469,10 +461,10 @@ def _attn_bwd_dq(dq, q, K, V,  #
     # Extract two halves from q (already loaded tensor, not a pointer) using reshape+split
     q1, q2 = q.reshape([BLOCK_M2, 2, half_dim]).permute(0, 2, 1).split()
     
-    # Inverse RoPE: use -sin
-    q1_inv = q1 * cos_q_half - q2 * (-sin_q_half)
-    q2_inv = q2 * cos_q_half + q1 * (-sin_q_half)
-    q = tl.join(q1_inv, q2_inv).permute(0, 2, 1).reshape([BLOCK_M2, HEAD_DIM]).to(tl.float16)
+    # Forward RoPE: use +sin (reconstruct rotated Q for recomputation)
+    q1_rot = q1 * cos_q_half - q2 * sin_q_half
+    q2_rot = q2 * cos_q_half + q1 * sin_q_half
+    q = tl.join(q1_rot, q2_rot).permute(0, 2, 1).reshape([BLOCK_M2, HEAD_DIM]).to(tl.float16)
 
     kT_ptrs = K + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
     vT_ptrs = V + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
@@ -499,10 +491,10 @@ def _attn_bwd_dq(dq, q, K, V,  #
         k1 = tl.load(k1_ptrs)
         k2 = tl.load(k2_ptrs)
         
-        # Inverse RoPE: use -sin
-        k1_inv = k1 * cos_k_half - k2 * (-sin_k_half)
-        k2_inv = k2 * cos_k_half + k1 * (-sin_k_half)
-        kT = tl.join(k1_inv, k2_inv).permute(0, 2, 1).reshape([BLOCK_N2, HEAD_DIM])
+        # Forward RoPE: use +sin (reconstruct rotated K for recomputation)
+        k1_rot = k1 * cos_k_half - k2 * sin_k_half
+        k2_rot = k2 * cos_k_half + k1 * sin_k_half
+        kT = tl.join(k1_rot, k2_rot).permute(0, 2, 1).reshape([BLOCK_N2, HEAD_DIM])
 
         # Transpose to [HEAD_DIM, BLOCK_N2] and convert back to float16
         kT = tl.trans(kT).to(tl.float16)
@@ -526,15 +518,7 @@ def _attn_bwd_dq(dq, q, K, V,  #
         kT_ptrs += step_n * stride_tok
         vT_ptrs += step_n * stride_tok
 
-    # Apply INVERSE RoPE to dQ before returning
-    # Mathematical reason: dL/dQ_original = R^T(θ) @ dL/dQ_rotated = R(-θ) @ dL/dQ_rotated
-    # Extract two halves from dq (local accumulator) using reshape+split
-    dq1, dq2 = dq.reshape([BLOCK_M2, 2, half_dim]).permute(0, 2, 1).split()
-    # Inverse RoPE: use -sin
-    dq1_inv = dq1 * cos_q_half - dq2 * (-sin_q_half)
-    dq2_inv = dq2 * cos_q_half + dq1 * (-sin_q_half)
-    dq = tl.join(dq1_inv, dq2_inv).permute(0, 2, 1).reshape([BLOCK_M2, HEAD_DIM])
-
+    # Return dq in rotated space (Inverse RoPE will be applied in wrapper)
     return dq
 
 
@@ -628,6 +612,22 @@ def _attn_bwd(Q, K, V, sm_scale,  #
 
     # Write back dK.
     dk *= sm_scale
+    
+    # Apply INVERSE RoPE to dK (unified projection to original space)
+    HALF_DIM: tl.constexpr = HEAD_DIM // 2
+    offs_d_first_dk = tl.arange(0, HALF_DIM)
+    # Load RoPE frequencies for K positions
+    freqs_cos_k_final_ptrs = freqs_cos_ptr + (offs_n[:, None] * stride_freqs_seq + offs_d_first_dk[None, :] * stride_freqs_dim)
+    freqs_sin_k_final_ptrs = freqs_sin_ptr + (offs_n[:, None] * stride_freqs_seq + offs_d_first_dk[None, :] * stride_freqs_dim)
+    mask_k_final = (offs_n[:, None] < N_CTX) & (offs_d_first_dk[None, :] < HALF_DIM)
+    cos_k_final = tl.load(freqs_cos_k_final_ptrs, mask=mask_k_final, other=1.0).to(tl.float32)
+    sin_k_final = tl.load(freqs_sin_k_final_ptrs, mask=mask_k_final, other=0.0).to(tl.float32)
+    # Extract and apply inverse rotation: R^T = R(-θ) = [cos, +sin; -sin, cos]
+    dk1, dk2 = dk.reshape([BLOCK_N1, 2, HALF_DIM]).permute(0, 2, 1).split()
+    dk1_inv = dk1 * cos_k_final + dk2 * sin_k_final
+    dk2_inv = dk2 * cos_k_final - dk1 * sin_k_final
+    dk = tl.join(dk1_inv, dk2_inv).permute(0, 2, 1).reshape([BLOCK_N1, HEAD_DIM])
+    
     dk_ptrs = DK + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
     tl.store(dk_ptrs, dk)
 
@@ -680,8 +680,24 @@ def _attn_bwd(Q, K, V, sm_scale,  #
                       MASK=False,  #
                       )
     # Write back dQ.
-    dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     dq *= LN2
+    
+    # Apply INVERSE RoPE to dQ (unified projection to original space)
+    # Note: HALF_DIM already defined above, reuse it
+    offs_d_first_dq = tl.arange(0, HALF_DIM)
+    # Load RoPE frequencies for Q positions
+    freqs_cos_q_final_ptrs = freqs_cos_ptr + (offs_m[:, None] * stride_freqs_seq + offs_d_first_dq[None, :] * stride_freqs_dim)
+    freqs_sin_q_final_ptrs = freqs_sin_ptr + (offs_m[:, None] * stride_freqs_seq + offs_d_first_dq[None, :] * stride_freqs_dim)
+    mask_q_final = (offs_m[:, None] < N_CTX) & (offs_d_first_dq[None, :] < HALF_DIM)
+    cos_q_final = tl.load(freqs_cos_q_final_ptrs, mask=mask_q_final, other=1.0).to(tl.float32)
+    sin_q_final = tl.load(freqs_sin_q_final_ptrs, mask=mask_q_final, other=0.0).to(tl.float32)
+    # Extract and apply inverse rotation: R^T = R(-θ) = [cos, +sin; -sin, cos]
+    dq1, dq2 = dq.reshape([BLOCK_M2, 2, HALF_DIM]).permute(0, 2, 1).split()
+    dq1_inv = dq1 * cos_q_final + dq2 * sin_q_final
+    dq2_inv = dq2 * cos_q_final - dq1 * sin_q_final
+    dq = tl.join(dq1_inv, dq2_inv).permute(0, 2, 1).reshape([BLOCK_M2, HEAD_DIM])
+    
+    dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     tl.store(dq_ptrs, dq)
 
 
