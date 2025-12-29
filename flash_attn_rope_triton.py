@@ -44,55 +44,6 @@ def is_hopper():
     return is_cuda() and torch.cuda.get_device_capability()[0] == 9
 
 
-@triton.jit
-def _rotate_half(x, HEAD_DIM: tl.constexpr):
-    """
-    Split layout rotation: [x1, x2] -> [-x2, x1]
-    x: shape [BLOCK, HEAD_DIM]
-
-    Uses tl.split + tl.join for efficiency (avoids slice assignment overhead)
-    """
-    half_dim: tl.constexpr = HEAD_DIM // 2
-    # Reshape to expose the split dimension
-    # x: [BLOCK, HEAD_DIM] -> [BLOCK, 2, HEAD_DIM//2]
-    x_reshaped = tl.reshape(x, [x.shape[0], 2, half_dim])
-    # Split into two halves: x1 = x[:, 0, :], x2 = x[:, 1, :]
-    x1, x2 = tl.split(x_reshaped, axis=1)
-    # x1, x2: [BLOCK, 1, HEAD_DIM//2], squeeze to [BLOCK, HEAD_DIM//2]
-    x1 = tl.reshape(x1, [x.shape[0], half_dim])
-    x2 = tl.reshape(x2, [x.shape[0], half_dim])
-    # Rotate: [-x2, x1]
-    rotated = tl.join(-x2, x1)  # [BLOCK, HEAD_DIM]
-    return rotated
-
-
-@triton.jit
-def _apply_rope(x, freqs_cos, freqs_sin, HEAD_DIM: tl.constexpr, transpose_input: tl.constexpr = False):
-    """
-    Apply RoPE: x * cos + rotate_half(x) * sin
-
-    Args:
-        x: input tensor
-        freqs_cos, freqs_sin: frequency tables
-        HEAD_DIM: head dimension (constexpr)
-        transpose_input: if True, x is [HEAD_DIM, BLOCK] and needs transposition
-                        if False, x is [BLOCK, HEAD_DIM]
-
-    Returns:
-        rotated tensor in the same layout as input
-    """
-    if transpose_input:
-        # x is [HEAD_DIM, BLOCK], transpose to [BLOCK, HEAD_DIM]
-        x = tl.trans(x)
-        # freqs are already [BLOCK, HEAD_DIM], apply RoPE
-        x_rot_half = _rotate_half(x, HEAD_DIM)
-        result = x * freqs_cos + x_rot_half * freqs_sin
-        # Transpose back to [HEAD_DIM, BLOCK]
-        return tl.trans(result)
-    else:
-        # x is [BLOCK, HEAD_DIM], directly apply
-        x_rot_half = _rotate_half(x, HEAD_DIM)
-        return x * freqs_cos + x_rot_half * freqs_sin
 
 
 @triton.jit
@@ -119,25 +70,36 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     else:
         offsetv_y = offset_y + lo
     # Prepare dimension indices for RoPE frequency loading
-    offs_d = tl.arange(0, HEAD_DIM)
+    half_dim: tl.constexpr = HEAD_DIM // 2
+    offs_d_first = tl.arange(0, half_dim)
     # loop over k, v and update accumulator
     for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=warp_specialize):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- load K and apply RoPE --
         k = desc_k.load([offsetk_y, 0]).T  # k is now [HEAD_DIM, BLOCK_N]
 
-        # Load RoPE frequencies for K positions
-        offs_n_local = start_n + offs_n
-        freqs_cos_k_ptrs = freqs_cos_ptr + (offs_n_local[:, None] * stride_freqs_seq + offs_d[None, :] * stride_freqs_dim)
-        freqs_sin_k_ptrs = freqs_sin_ptr + (offs_n_local[:, None] * stride_freqs_seq + offs_d[None, :] * stride_freqs_dim)
-        mask_k = (offs_n_local[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM)
-        freqs_cos_k = tl.load(freqs_cos_k_ptrs, mask=mask_k, other=1.0).to(tl.float32)
-        freqs_sin_k = tl.load(freqs_sin_k_ptrs, mask=mask_k, other=0.0).to(tl.float32)
+        # Transpose K to [BLOCK_N, HEAD_DIM] for RoPE application
+        k = tl.trans(k)  # Now [BLOCK_N, HEAD_DIM]
 
-        # Apply RoPE to K with transpose_input=True
-        # Input k: [HEAD_DIM, BLOCK_N], freqs: [BLOCK_N, HEAD_DIM]
-        # Output: [HEAD_DIM, BLOCK_N] ready for matmul
-        k = _apply_rope(k, freqs_cos_k, freqs_sin_k, HEAD_DIM, transpose_input=True)
+        # Load RoPE frequencies for K positions (only need first half for split layout)
+        offs_n_local = start_n + offs_n
+        freqs_cos_k_ptrs = freqs_cos_ptr + (offs_n_local[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+        freqs_sin_k_ptrs = freqs_sin_ptr + (offs_n_local[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+        mask_k_half = (offs_n_local[:, None] < N_CTX) & (offs_d_first[None, :] < half_dim)
+        cos_k_half = tl.load(freqs_cos_k_ptrs, mask=mask_k_half, other=1.0).to(tl.float32)
+        sin_k_half = tl.load(freqs_sin_k_ptrs, mask=mask_k_half, other=0.0).to(tl.float32)
+
+        # Extract two halves from K
+        k1 = k[:, :half_dim]  # First half: [BLOCK_N, HEAD_DIM//2]
+        k2 = k[:, half_dim:]  # Second half: [BLOCK_N, HEAD_DIM//2]
+
+        # Apply RoPE rotation
+        k1_new = k1 * cos_k_half - k2 * sin_k_half
+        k2_new = k2 * cos_k_half + k1 * sin_k_half
+
+        # Rejoin and transpose back to [HEAD_DIM, BLOCK_N] for matmul
+        k = tl.join(k1_new, k2_new)  # [BLOCK_N, HEAD_DIM]
+        k = tl.trans(k)  # [HEAD_DIM, BLOCK_N]
 
         # -- compute qk ----
         qk = tl.dot(q, k)
@@ -295,16 +257,28 @@ def _attn_fwd(sm_scale, M,  #
     # load q: it will stay in SRAM throughout
     q = desc_q.load([qo_offset_y, 0])
 
-    # Load RoPE frequencies for Q positions and apply RoPE
-    offs_d = tl.arange(0, HEAD_DIM)
-    freqs_cos_q_ptrs = freqs_cos_ptr + (offs_m[:, None] * stride_freqs_seq + offs_d[None, :] * stride_freqs_dim)
-    freqs_sin_q_ptrs = freqs_sin_ptr + (offs_m[:, None] * stride_freqs_seq + offs_d[None, :] * stride_freqs_dim)
-    mask_q = (offs_m[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM)
-    freqs_cos_q = tl.load(freqs_cos_q_ptrs, mask=mask_q, other=1.0).to(tl.float32)
-    freqs_sin_q = tl.load(freqs_sin_q_ptrs, mask=mask_q, other=0.0).to(tl.float32)
+    # Apply RoPE to Q using direct pointer-style computation
+    # Split Q into two halves and apply rotation formula
+    half_dim: tl.constexpr = HEAD_DIM // 2
+    offs_d_first = tl.arange(0, half_dim)
 
-    # Apply RoPE to Q (Q is [BLOCK_M, HEAD_DIM])
-    q = _apply_rope(q, freqs_cos_q, freqs_sin_q, HEAD_DIM, transpose_input=False)
+    # Load cos/sin frequencies for first half (these apply to both halves in split layout)
+    freqs_cos_q_ptrs = freqs_cos_ptr + (offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+    freqs_sin_q_ptrs = freqs_sin_ptr + (offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+    mask_q_half = (offs_m[:, None] < N_CTX) & (offs_d_first[None, :] < half_dim)
+    cos_half = tl.load(freqs_cos_q_ptrs, mask=mask_q_half, other=1.0).to(tl.float32)
+    sin_half = tl.load(freqs_sin_q_ptrs, mask=mask_q_half, other=0.0).to(tl.float32)
+
+    # Extract two halves from Q
+    q1 = q[:, :half_dim]  # First half: [BLOCK_M, HEAD_DIM//2]
+    q2 = q[:, half_dim:]  # Second half: [BLOCK_M, HEAD_DIM//2]
+
+    # Apply RoPE rotation: [q1, q2] -> [q1*cos - q2*sin, q2*cos + q1*sin]
+    q1_new = q1 * cos_half - q2 * sin_half
+    q2_new = q2 * cos_half + q1 * sin_half
+
+    # Rejoin the two halves
+    q = tl.join(q1_new, q2_new)  # [BLOCK_M, HEAD_DIM]
 
     # stage 1: off-band
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
@@ -373,15 +347,24 @@ def _attn_bwd_dkdv(dk, dv,  #
     offs_n = start_n + tl.arange(0, BLOCK_N1)
     offs_k = tl.arange(0, HEAD_DIM)
 
-    # Load RoPE frequencies for K positions and apply inverse RoPE to k
-    freqs_cos_k_ptrs = freqs_cos_ptr + (offs_n[:, None] * stride_freqs_seq + offs_k[None, :] * stride_freqs_dim)
-    freqs_sin_k_ptrs = freqs_sin_ptr + (offs_n[:, None] * stride_freqs_seq + offs_k[None, :] * stride_freqs_dim)
-    mask_k = (offs_n[:, None] < N_CTX) & (offs_k[None, :] < HEAD_DIM)
-    freqs_cos_k = tl.load(freqs_cos_k_ptrs, mask=mask_k, other=1.0).to(tl.float32)
-    freqs_sin_k = tl.load(freqs_sin_k_ptrs, mask=mask_k, other=0.0).to(tl.float32)
+    # Apply inverse RoPE to k (use -sin for inverse rotation)
+    half_dim: tl.constexpr = HEAD_DIM // 2
+    offs_d_first = tl.arange(0, half_dim)
 
-    # Apply inverse RoPE to k (use -freqs_sin for inverse)
-    k = _apply_rope(k, freqs_cos_k, -freqs_sin_k, HEAD_DIM, transpose_input=False)
+    # Load RoPE frequencies for K positions (only need first half)
+    freqs_cos_k_ptrs = freqs_cos_ptr + (offs_n[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+    freqs_sin_k_ptrs = freqs_sin_ptr + (offs_n[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+    mask_k_half = (offs_n[:, None] < N_CTX) & (offs_d_first[None, :] < half_dim)
+    cos_k_half = tl.load(freqs_cos_k_ptrs, mask=mask_k_half, other=1.0).to(tl.float32)
+    sin_k_half = tl.load(freqs_sin_k_ptrs, mask=mask_k_half, other=0.0).to(tl.float32)
+
+    # Extract two halves from K and apply inverse RoPE
+    k1 = k[:, :half_dim]
+    k2 = k[:, half_dim:]
+    # Inverse RoPE: use -sin
+    k1_inv = k1 * cos_k_half - k2 * (-sin_k_half)  # = k1 * cos + k2 * sin
+    k2_inv = k2 * cos_k_half + k1 * (-sin_k_half)  # = k2 * cos - k1 * sin
+    k = tl.join(k1_inv, k2_inv)
 
     qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_k[:, None] * stride_d
     do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
@@ -390,18 +373,29 @@ def _attn_bwd_dkdv(dk, dv,  #
     curr_m = start_m
     step_m = BLOCK_M1
     for blk_idx in range(num_steps):
-        qT = tl.load(qT_ptrs)
+        qT = tl.load(qT_ptrs)  # [HEAD_DIM, BLOCK_M1]
 
-        # Load RoPE frequencies for Q positions and apply inverse RoPE
+        # Load RoPE frequencies for Q positions (only need first half)
         offs_m_curr = curr_m + tl.arange(0, BLOCK_M1)
-        freqs_cos_q_ptrs = freqs_cos_ptr + (offs_m_curr[:, None] * stride_freqs_seq + offs_k[None, :] * stride_freqs_dim)
-        freqs_sin_q_ptrs = freqs_sin_ptr + (offs_m_curr[:, None] * stride_freqs_seq + offs_k[None, :] * stride_freqs_dim)
-        mask_q = (offs_m_curr[:, None] < N_CTX) & (offs_k[None, :] < HEAD_DIM)
-        freqs_cos_q = tl.load(freqs_cos_q_ptrs, mask=mask_q, other=1.0).to(tl.float32)
-        freqs_sin_q = tl.load(freqs_sin_q_ptrs, mask=mask_q, other=0.0).to(tl.float32)
+        freqs_cos_q_ptrs = freqs_cos_ptr + (offs_m_curr[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+        freqs_sin_q_ptrs = freqs_sin_ptr + (offs_m_curr[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+        mask_q_half = (offs_m_curr[:, None] < N_CTX) & (offs_d_first[None, :] < half_dim)
+        cos_q_half = tl.load(freqs_cos_q_ptrs, mask=mask_q_half, other=1.0).to(tl.float32)
+        sin_q_half = tl.load(freqs_sin_q_ptrs, mask=mask_q_half, other=0.0).to(tl.float32)
 
-        # qT is [HEAD_DIM, BLOCK_M1], need to transpose, apply RoPE, then transpose back
-        qT = _apply_rope(qT, freqs_cos_q, -freqs_sin_q, HEAD_DIM, transpose_input=True)
+        # qT is [HEAD_DIM, BLOCK_M1], transpose to [BLOCK_M1, HEAD_DIM]
+        qT = tl.trans(qT)
+
+        # Extract two halves and apply inverse RoPE
+        q1 = qT[:, :half_dim]
+        q2 = qT[:, half_dim:]
+        # Inverse RoPE: use -sin
+        q1_inv = q1 * cos_q_half - q2 * (-sin_q_half)
+        q2_inv = q2 * cos_q_half + q1 * (-sin_q_half)
+        qT = tl.join(q1_inv, q2_inv)
+
+        # Transpose back to [HEAD_DIM, BLOCK_M1]
+        qT = tl.trans(qT)
 
         # Load m before computing qk to reduce pipeline stall.
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
@@ -431,7 +425,12 @@ def _attn_bwd_dkdv(dk, dv,  #
 
     # Apply INVERSE RoPE to dK before returning
     # Mathematical reason: dL/dK_original = R^T(θ) @ dL/dK_rotated = R(-θ) @ dL/dK_rotated
-    dk = _apply_rope(dk, freqs_cos_k, -freqs_sin_k, HEAD_DIM, transpose_input=False)
+    dk1 = dk[:, :half_dim]
+    dk2 = dk[:, half_dim:]
+    # Inverse RoPE: use -sin
+    dk1_inv = dk1 * cos_k_half - dk2 * (-sin_k_half)
+    dk2_inv = dk2 * cos_k_half + dk1 * (-sin_k_half)
+    dk = tl.join(dk1_inv, dk2_inv)
 
     return dk, dv
 
@@ -455,15 +454,24 @@ def _attn_bwd_dq(dq, q, K, V,  #
     offs_n = start_n + tl.arange(0, BLOCK_N2)
     offs_k = tl.arange(0, HEAD_DIM)
 
-    # Load RoPE frequencies for Q positions and apply inverse RoPE to q
-    freqs_cos_q_ptrs = freqs_cos_ptr + (offs_m[:, None] * stride_freqs_seq + offs_k[None, :] * stride_freqs_dim)
-    freqs_sin_q_ptrs = freqs_sin_ptr + (offs_m[:, None] * stride_freqs_seq + offs_k[None, :] * stride_freqs_dim)
-    mask_q = (offs_m[:, None] < N_CTX) & (offs_k[None, :] < HEAD_DIM)
-    freqs_cos_q = tl.load(freqs_cos_q_ptrs, mask=mask_q, other=1.0).to(tl.float32)
-    freqs_sin_q = tl.load(freqs_sin_q_ptrs, mask=mask_q, other=0.0).to(tl.float32)
-
     # Apply inverse RoPE to q
-    q = _apply_rope(q, freqs_cos_q, -freqs_sin_q, HEAD_DIM, transpose_input=False)
+    half_dim: tl.constexpr = HEAD_DIM // 2
+    offs_d_first = tl.arange(0, half_dim)
+
+    # Load RoPE frequencies for Q positions (only need first half)
+    freqs_cos_q_ptrs = freqs_cos_ptr + (offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+    freqs_sin_q_ptrs = freqs_sin_ptr + (offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+    mask_q_half = (offs_m[:, None] < N_CTX) & (offs_d_first[None, :] < half_dim)
+    cos_q_half = tl.load(freqs_cos_q_ptrs, mask=mask_q_half, other=1.0).to(tl.float32)
+    sin_q_half = tl.load(freqs_sin_q_ptrs, mask=mask_q_half, other=0.0).to(tl.float32)
+
+    # Extract two halves and apply inverse RoPE
+    q1 = q[:, :half_dim]
+    q2 = q[:, half_dim:]
+    # Inverse RoPE: use -sin
+    q1_inv = q1 * cos_q_half - q2 * (-sin_q_half)
+    q2_inv = q2 * cos_q_half + q1 * (-sin_q_half)
+    q = tl.join(q1_inv, q2_inv)
 
     kT_ptrs = K + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
     vT_ptrs = V + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
@@ -474,19 +482,30 @@ def _attn_bwd_dq(dq, q, K, V,  #
     curr_n = start_n
     step_n = BLOCK_N2
     for blk_idx in range(num_steps):
-        kT = tl.load(kT_ptrs)
+        kT = tl.load(kT_ptrs)  # [HEAD_DIM, BLOCK_N2]
         vT = tl.load(vT_ptrs)
 
-        # Load RoPE frequencies for K positions and apply inverse RoPE
+        # Load RoPE frequencies for K positions (only need first half)
         offs_n_curr = curr_n + tl.arange(0, BLOCK_N2)
-        freqs_cos_k_ptrs = freqs_cos_ptr + (offs_n_curr[:, None] * stride_freqs_seq + offs_k[None, :] * stride_freqs_dim)
-        freqs_sin_k_ptrs = freqs_sin_ptr + (offs_n_curr[:, None] * stride_freqs_seq + offs_k[None, :] * stride_freqs_dim)
-        mask_k = (offs_n_curr[:, None] < N_CTX) & (offs_k[None, :] < HEAD_DIM)
-        freqs_cos_k = tl.load(freqs_cos_k_ptrs, mask=mask_k, other=1.0).to(tl.float32)
-        freqs_sin_k = tl.load(freqs_sin_k_ptrs, mask=mask_k, other=0.0).to(tl.float32)
+        freqs_cos_k_ptrs = freqs_cos_ptr + (offs_n_curr[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+        freqs_sin_k_ptrs = freqs_sin_ptr + (offs_n_curr[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim)
+        mask_k_half = (offs_n_curr[:, None] < N_CTX) & (offs_d_first[None, :] < half_dim)
+        cos_k_half = tl.load(freqs_cos_k_ptrs, mask=mask_k_half, other=1.0).to(tl.float32)
+        sin_k_half = tl.load(freqs_sin_k_ptrs, mask=mask_k_half, other=0.0).to(tl.float32)
 
-        # kT is [HEAD_DIM, BLOCK_N2], need to transpose, apply RoPE, then transpose back
-        kT = _apply_rope(kT, freqs_cos_k, -freqs_sin_k, HEAD_DIM, transpose_input=True)
+        # kT is [HEAD_DIM, BLOCK_N2], transpose to [BLOCK_N2, HEAD_DIM]
+        kT = tl.trans(kT)
+
+        # Extract two halves and apply inverse RoPE
+        k1 = kT[:, :half_dim]
+        k2 = kT[:, half_dim:]
+        # Inverse RoPE: use -sin
+        k1_inv = k1 * cos_k_half - k2 * (-sin_k_half)
+        k2_inv = k2 * cos_k_half + k1 * (-sin_k_half)
+        kT = tl.join(k1_inv, k2_inv)
+
+        # Transpose back to [HEAD_DIM, BLOCK_N2]
+        kT = tl.trans(kT)
 
         qk = tl.dot(q, kT)
         p = tl.math.exp2(qk - m)
@@ -509,7 +528,12 @@ def _attn_bwd_dq(dq, q, K, V,  #
 
     # Apply INVERSE RoPE to dQ before returning
     # Mathematical reason: dL/dQ_original = R^T(θ) @ dL/dQ_rotated = R(-θ) @ dL/dQ_rotated
-    dq = _apply_rope(dq, freqs_cos_q, -freqs_sin_q, HEAD_DIM, transpose_input=False)
+    dq1 = dq[:, :half_dim]
+    dq2 = dq[:, half_dim:]
+    # Inverse RoPE: use -sin
+    dq1_inv = dq1 * cos_q_half - dq2 * (-sin_q_half)
+    dq2_inv = dq2 * cos_q_half + dq1 * (-sin_q_half)
+    dq = tl.join(dq1_inv, dq2_inv)
 
     return dq
 
