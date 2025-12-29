@@ -388,8 +388,8 @@ def _attn_bwd_dkdv(dk1, dk2, dv,  #
 @triton.jit
 def _attn_bwd_dq(dq1, dq2,  #
                  q1_rot, q2_rot, K, V,  #
-                 freqs_cos_ptr, freqs_sin_ptr,  #
                  do, m, D,  #
+                 freqs_cos_ptr, freqs_sin_ptr,  #
                  stride_tok, stride_d,  #
                  stride_freqs_seq, stride_freqs_dim,  #
                  H, N_CTX,  #
@@ -443,8 +443,8 @@ def _attn_bwd_dq(dq1, dq2,  #
         ds = p * (dp - Di[:, None])
         ds = ds.to(tl.float16)
 
-        dq1 += tl.dot(ds, tl.trans(k1_rot))
-        dq2 += tl.dot(ds, tl.trans(k2_rot))
+        dq1 += tl.dot(ds, k1_rot)
+        dq2 += tl.dot(ds, k2_rot)
 
         curr_n += step_n
     return dq1, dq2
@@ -595,8 +595,8 @@ def _attn_bwd(Q, K, V, sm_scale,  #
         num_steps = BLOCK_M2 // MASK_BLOCK_N2
         dq1, dq2 = _attn_bwd_dq(dq1, dq2,  #
                                 q1_rot, q2_rot, K, V,  #
-                                freqs_cos_ptr, freqs_sin_ptr,  #
                                 do, m, D,  #
+                                freqs_cos_ptr, freqs_sin_ptr,  #
                                 stride_tok, stride_d,  #
                                 stride_freqs_seq, stride_freqs_dim,  #
                                 H, N_CTX,  #
@@ -610,8 +610,8 @@ def _attn_bwd(Q, K, V, sm_scale,  #
 
     dq1, dq2 = _attn_bwd_dq(dq1, dq2,  #
                             q1_rot, q2_rot, K, V,  #
-                            freqs_cos_ptr, freqs_sin_ptr,  #
                             do, m, D,  #
+                            freqs_cos_ptr, freqs_sin_ptr,  #
                             stride_tok, stride_d,  #
                             stride_freqs_seq, stride_freqs_dim,  #
                             H, N_CTX,  #
