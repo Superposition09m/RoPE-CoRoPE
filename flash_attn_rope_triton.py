@@ -45,8 +45,61 @@ def is_hopper():
 
 
 @triton.jit
+def _rotate_half(x, HEAD_DIM: tl.constexpr):
+    """
+    Split layout rotation: [x1, x2] -> [-x2, x1]
+    x: shape [BLOCK, HEAD_DIM]
+
+    Uses tl.split + tl.join for efficiency (avoids slice assignment overhead)
+    """
+    half_dim: tl.constexpr = HEAD_DIM // 2
+    # Reshape to expose the split dimension
+    # x: [BLOCK, HEAD_DIM] -> [BLOCK, 2, HEAD_DIM//2]
+    x_reshaped = tl.reshape(x, [x.shape[0], 2, half_dim])
+    # Split into two halves: x1 = x[:, 0, :], x2 = x[:, 1, :]
+    x1, x2 = tl.split(x_reshaped, axis=1)
+    # x1, x2: [BLOCK, 1, HEAD_DIM//2], squeeze to [BLOCK, HEAD_DIM//2]
+    x1 = tl.reshape(x1, [x.shape[0], half_dim])
+    x2 = tl.reshape(x2, [x.shape[0], half_dim])
+    # Rotate: [-x2, x1]
+    rotated = tl.join(-x2, x1)  # [BLOCK, HEAD_DIM]
+    return rotated
+
+
+@triton.jit
+def _apply_rope(x, freqs_cos, freqs_sin, HEAD_DIM: tl.constexpr, transpose_input: tl.constexpr = False):
+    """
+    Apply RoPE: x * cos + rotate_half(x) * sin
+
+    Args:
+        x: input tensor
+        freqs_cos, freqs_sin: frequency tables
+        HEAD_DIM: head dimension (constexpr)
+        transpose_input: if True, x is [HEAD_DIM, BLOCK] and needs transposition
+                        if False, x is [BLOCK, HEAD_DIM]
+
+    Returns:
+        rotated tensor in the same layout as input
+    """
+    if transpose_input:
+        # x is [HEAD_DIM, BLOCK], transpose to [BLOCK, HEAD_DIM]
+        x = tl.trans(x)
+        # freqs are already [BLOCK, HEAD_DIM], apply RoPE
+        x_rot_half = _rotate_half(x, HEAD_DIM)
+        result = x * freqs_cos + x_rot_half * freqs_sin
+        # Transpose back to [HEAD_DIM, BLOCK]
+        return tl.trans(result)
+    else:
+        # x is [BLOCK, HEAD_DIM], directly apply
+        x_rot_half = _rotate_half(x, HEAD_DIM)
+        return x * freqs_cos + x_rot_half * freqs_sin
+
+
+@triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
                     desc_k, desc_v,  #
+                    freqs_cos_ptr, freqs_sin_ptr,  #
+                    stride_freqs_seq, stride_freqs_dim,  #
                     offset_y, dtype: tl.constexpr, start_m, qk_scale,  #
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
@@ -65,11 +118,28 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         offsetv_y = offset_y * HEAD_DIM + lo
     else:
         offsetv_y = offset_y + lo
+    # Prepare dimension indices for RoPE frequency loading
+    offs_d = tl.arange(0, HEAD_DIM)
     # loop over k, v and update accumulator
     for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=warp_specialize):
         start_n = tl.multiple_of(start_n, BLOCK_N)
+        # -- load K and apply RoPE --
+        k = desc_k.load([offsetk_y, 0]).T  # k is now [HEAD_DIM, BLOCK_N]
+
+        # Load RoPE frequencies for K positions
+        offs_n_local = start_n + offs_n
+        freqs_cos_k_ptrs = freqs_cos_ptr + (offs_n_local[:, None] * stride_freqs_seq + offs_d[None, :] * stride_freqs_dim)
+        freqs_sin_k_ptrs = freqs_sin_ptr + (offs_n_local[:, None] * stride_freqs_seq + offs_d[None, :] * stride_freqs_dim)
+        mask_k = (offs_n_local[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM)
+        freqs_cos_k = tl.load(freqs_cos_k_ptrs, mask=mask_k, other=1.0).to(tl.float32)
+        freqs_sin_k = tl.load(freqs_sin_k_ptrs, mask=mask_k, other=0.0).to(tl.float32)
+
+        # Apply RoPE to K with transpose_input=True
+        # Input k: [HEAD_DIM, BLOCK_N], freqs: [BLOCK_N, HEAD_DIM]
+        # Output: [HEAD_DIM, BLOCK_N] ready for matmul
+        k = _apply_rope(k, freqs_cos_k, freqs_sin_k, HEAD_DIM, transpose_input=True)
+
         # -- compute qk ----
-        k = desc_k.load([offsetk_y, 0]).T
         qk = tl.dot(q, k)
         if STAGE == 2:
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
@@ -177,6 +247,8 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
                  prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
 def _attn_fwd(sm_scale, M,  #
+              freqs_cos_ptr, freqs_sin_ptr,  #
+              stride_freqs_seq, stride_freqs_dim,  #
               Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
               HEAD_DIM: tl.constexpr,  #
               BLOCK_M: tl.constexpr,  #
@@ -222,12 +294,26 @@ def _attn_fwd(sm_scale, M,  #
     qk_scale *= 1.44269504  # 1/log(2)
     # load q: it will stay in SRAM throughout
     q = desc_q.load([qo_offset_y, 0])
+
+    # Load RoPE frequencies for Q positions and apply RoPE
+    offs_d = tl.arange(0, HEAD_DIM)
+    freqs_cos_q_ptrs = freqs_cos_ptr + (offs_m[:, None] * stride_freqs_seq + offs_d[None, :] * stride_freqs_dim)
+    freqs_sin_q_ptrs = freqs_sin_ptr + (offs_m[:, None] * stride_freqs_seq + offs_d[None, :] * stride_freqs_dim)
+    mask_q = (offs_m[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM)
+    freqs_cos_q = tl.load(freqs_cos_q_ptrs, mask=mask_q, other=1.0).to(tl.float32)
+    freqs_sin_q = tl.load(freqs_sin_q_ptrs, mask=mask_q, other=0.0).to(tl.float32)
+
+    # Apply RoPE to Q (Q is [BLOCK_M, HEAD_DIM])
+    q = _apply_rope(q, freqs_cos_q, freqs_sin_q, HEAD_DIM, transpose_input=False)
+
     # stage 1: off-band
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
     # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
     if STAGE & 1:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,  #
                                         desc_k, desc_v,  #
+                                        freqs_cos_ptr, freqs_sin_ptr,  #
+                                        stride_freqs_seq, stride_freqs_dim,  #
                                         offset_y, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         4 - STAGE, offs_m, offs_n, N_CTX,  #
@@ -236,6 +322,8 @@ def _attn_fwd(sm_scale, M,  #
     if STAGE & 2:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,  #
                                         desc_k, desc_v,  #
+                                        freqs_cos_ptr, freqs_sin_ptr,  #
+                                        stride_freqs_seq, stride_freqs_dim,  #
                                         offset_y, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         2, offs_m, offs_n, N_CTX,  #
@@ -271,6 +359,8 @@ def _attn_bwd_dkdv(dk, dv,  #
                    Q, k, v, sm_scale,  #
                    DO,  #
                    M, D,  #
+                   freqs_cos_ptr, freqs_sin_ptr,  #
+                   stride_freqs_seq, stride_freqs_dim,  #
                    # shared by Q/K/V/DO.
                    stride_tok, stride_d,  #
                    H, N_CTX, BLOCK_M1: tl.constexpr,  #
@@ -282,6 +372,17 @@ def _attn_bwd_dkdv(dk, dv,  #
     offs_m = start_m + tl.arange(0, BLOCK_M1)
     offs_n = start_n + tl.arange(0, BLOCK_N1)
     offs_k = tl.arange(0, HEAD_DIM)
+
+    # Load RoPE frequencies for K positions and apply inverse RoPE to k
+    freqs_cos_k_ptrs = freqs_cos_ptr + (offs_n[:, None] * stride_freqs_seq + offs_k[None, :] * stride_freqs_dim)
+    freqs_sin_k_ptrs = freqs_sin_ptr + (offs_n[:, None] * stride_freqs_seq + offs_k[None, :] * stride_freqs_dim)
+    mask_k = (offs_n[:, None] < N_CTX) & (offs_k[None, :] < HEAD_DIM)
+    freqs_cos_k = tl.load(freqs_cos_k_ptrs, mask=mask_k, other=1.0).to(tl.float32)
+    freqs_sin_k = tl.load(freqs_sin_k_ptrs, mask=mask_k, other=0.0).to(tl.float32)
+
+    # Apply inverse RoPE to k (use -freqs_sin for inverse)
+    k = _apply_rope(k, freqs_cos_k, -freqs_sin_k, HEAD_DIM, transpose_input=False)
+
     qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_k[:, None] * stride_d
     do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     # BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work.
@@ -290,6 +391,18 @@ def _attn_bwd_dkdv(dk, dv,  #
     step_m = BLOCK_M1
     for blk_idx in range(num_steps):
         qT = tl.load(qT_ptrs)
+
+        # Load RoPE frequencies for Q positions and apply inverse RoPE
+        offs_m_curr = curr_m + tl.arange(0, BLOCK_M1)
+        freqs_cos_q_ptrs = freqs_cos_ptr + (offs_m_curr[:, None] * stride_freqs_seq + offs_k[None, :] * stride_freqs_dim)
+        freqs_sin_q_ptrs = freqs_sin_ptr + (offs_m_curr[:, None] * stride_freqs_seq + offs_k[None, :] * stride_freqs_dim)
+        mask_q = (offs_m_curr[:, None] < N_CTX) & (offs_k[None, :] < HEAD_DIM)
+        freqs_cos_q = tl.load(freqs_cos_q_ptrs, mask=mask_q, other=1.0).to(tl.float32)
+        freqs_sin_q = tl.load(freqs_sin_q_ptrs, mask=mask_q, other=0.0).to(tl.float32)
+
+        # qT is [HEAD_DIM, BLOCK_M1], need to transpose, apply RoPE, then transpose back
+        qT = _apply_rope(qT, freqs_cos_q, -freqs_sin_q, HEAD_DIM, transpose_input=True)
+
         # Load m before computing qk to reduce pipeline stall.
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
         m = tl.load(M + offs_m)
@@ -315,6 +428,11 @@ def _attn_bwd_dkdv(dk, dv,  #
         curr_m += step_m
         qT_ptrs += step_m * stride_tok
         do_ptrs += step_m * stride_tok
+
+    # Apply INVERSE RoPE to dK before returning
+    # Mathematical reason: dL/dK_original = R^T(θ) @ dL/dK_rotated = R(-θ) @ dL/dK_rotated
+    dk = _apply_rope(dk, freqs_cos_k, -freqs_sin_k, HEAD_DIM, transpose_input=False)
+
     return dk, dv
 
 
@@ -322,6 +440,8 @@ def _attn_bwd_dkdv(dk, dv,  #
 @triton.jit
 def _attn_bwd_dq(dq, q, K, V,  #
                  do, m, D,
+                 freqs_cos_ptr, freqs_sin_ptr,  #
+                 stride_freqs_seq, stride_freqs_dim,  #
                  # shared by Q/K/V/DO.
                  stride_tok, stride_d,  #
                  H, N_CTX,  #
@@ -334,6 +454,17 @@ def _attn_bwd_dq(dq, q, K, V,  #
     offs_m = start_m + tl.arange(0, BLOCK_M2)
     offs_n = start_n + tl.arange(0, BLOCK_N2)
     offs_k = tl.arange(0, HEAD_DIM)
+
+    # Load RoPE frequencies for Q positions and apply inverse RoPE to q
+    freqs_cos_q_ptrs = freqs_cos_ptr + (offs_m[:, None] * stride_freqs_seq + offs_k[None, :] * stride_freqs_dim)
+    freqs_sin_q_ptrs = freqs_sin_ptr + (offs_m[:, None] * stride_freqs_seq + offs_k[None, :] * stride_freqs_dim)
+    mask_q = (offs_m[:, None] < N_CTX) & (offs_k[None, :] < HEAD_DIM)
+    freqs_cos_q = tl.load(freqs_cos_q_ptrs, mask=mask_q, other=1.0).to(tl.float32)
+    freqs_sin_q = tl.load(freqs_sin_q_ptrs, mask=mask_q, other=0.0).to(tl.float32)
+
+    # Apply inverse RoPE to q
+    q = _apply_rope(q, freqs_cos_q, -freqs_sin_q, HEAD_DIM, transpose_input=False)
+
     kT_ptrs = K + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
     vT_ptrs = V + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
     # D (= delta) is pre-divided by ds_scale.
@@ -345,6 +476,18 @@ def _attn_bwd_dq(dq, q, K, V,  #
     for blk_idx in range(num_steps):
         kT = tl.load(kT_ptrs)
         vT = tl.load(vT_ptrs)
+
+        # Load RoPE frequencies for K positions and apply inverse RoPE
+        offs_n_curr = curr_n + tl.arange(0, BLOCK_N2)
+        freqs_cos_k_ptrs = freqs_cos_ptr + (offs_n_curr[:, None] * stride_freqs_seq + offs_k[None, :] * stride_freqs_dim)
+        freqs_sin_k_ptrs = freqs_sin_ptr + (offs_n_curr[:, None] * stride_freqs_seq + offs_k[None, :] * stride_freqs_dim)
+        mask_k = (offs_n_curr[:, None] < N_CTX) & (offs_k[None, :] < HEAD_DIM)
+        freqs_cos_k = tl.load(freqs_cos_k_ptrs, mask=mask_k, other=1.0).to(tl.float32)
+        freqs_sin_k = tl.load(freqs_sin_k_ptrs, mask=mask_k, other=0.0).to(tl.float32)
+
+        # kT is [HEAD_DIM, BLOCK_N2], need to transpose, apply RoPE, then transpose back
+        kT = _apply_rope(kT, freqs_cos_k, -freqs_sin_k, HEAD_DIM, transpose_input=True)
+
         qk = tl.dot(q, kT)
         p = tl.math.exp2(qk - m)
         # Autoregressive masking.
@@ -363,6 +506,11 @@ def _attn_bwd_dq(dq, q, K, V,  #
         curr_n += step_n
         kT_ptrs += step_n * stride_tok
         vT_ptrs += step_n * stride_tok
+
+    # Apply INVERSE RoPE to dQ before returning
+    # Mathematical reason: dL/dQ_original = R^T(θ) @ dL/dQ_rotated = R(-θ) @ dL/dQ_rotated
+    dq = _apply_rope(dq, freqs_cos_q, -freqs_sin_q, HEAD_DIM, transpose_input=False)
+
     return dq
 
 
@@ -371,6 +519,8 @@ def _attn_bwd(Q, K, V, sm_scale,  #
               DO,  #
               DQ, DK, DV,  #
               M, D,
+              freqs_cos_ptr, freqs_sin_ptr,  #
+              stride_freqs_seq, stride_freqs_dim,  #
               # shared by Q/K/V/DO.
               stride_z, stride_h, stride_tok, stride_d,  #
               H, N_CTX,  #
@@ -422,6 +572,8 @@ def _attn_bwd(Q, K, V, sm_scale,  #
                                 Q, k, v, sm_scale,  #
                                 DO,  #
                                 M, D,  #
+                                freqs_cos_ptr, freqs_sin_ptr,  #
+                                stride_freqs_seq, stride_freqs_dim,  #
                                 stride_tok, stride_d,  #
                                 H, N_CTX,  #
                                 MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
@@ -438,6 +590,8 @@ def _attn_bwd(Q, K, V, sm_scale,  #
         Q, k, v, sm_scale,  #
         DO,  #
         M, D,  #
+        freqs_cos_ptr, freqs_sin_ptr,  #
+        stride_freqs_seq, stride_freqs_dim,  #
         stride_tok, stride_d,  #
         H, N_CTX,  #
         BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
@@ -478,6 +632,8 @@ def _attn_bwd(Q, K, V, sm_scale,  #
         num_steps = BLOCK_M2 // MASK_BLOCK_N2
         dq = _attn_bwd_dq(dq, q, K, V,  #
                           do, m, D,  #
+                          freqs_cos_ptr, freqs_sin_ptr,  #
+                          stride_freqs_seq, stride_freqs_dim,  #
                           stride_tok, stride_d,  #
                           H, N_CTX,  #
                           BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM,  #
@@ -491,6 +647,8 @@ def _attn_bwd(Q, K, V, sm_scale,  #
 
     dq = _attn_bwd_dq(dq, q, K, V,  #
                       do, m, D,  #
+                      freqs_cos_ptr, freqs_sin_ptr,  #
+                      stride_freqs_seq, stride_freqs_dim,  #
                       stride_tok, stride_d,  #
                       H, N_CTX,  #
                       BLOCK_M2, BLOCK_N2, HEAD_DIM,  #
@@ -506,7 +664,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=True):
+    def forward(ctx, q, k, v, causal, sm_scale, freqs_cos, freqs_sin, warp_specialize=True):
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
@@ -559,6 +717,9 @@ class _attention(torch.autograd.Function):
                 extra_kern_args["maxnreg"] = 80
         _attn_fwd[grid](
             sm_scale, M,  #
+            freqs_cos, freqs_sin,  #
+            freqs_cos.stride(0),  #
+            freqs_cos.stride(1),  #
             q.shape[0], q.shape[1],  #
             desc_q, desc_k, desc_v, desc_o,  #
             N_CTX=q.shape[2],  #
@@ -569,7 +730,7 @@ class _attention(torch.autograd.Function):
             IS_HOPPER=is_hopper(),  #
             **extra_kern_args)
 
-        ctx.save_for_backward(q, k, v, o, M)
+        ctx.save_for_backward(q, k, v, o, M, freqs_cos, freqs_sin)
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
@@ -577,7 +738,7 @@ class _attention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, o, M = ctx.saved_tensors
+        q, k, v, o, M, freqs_cos, freqs_sin = ctx.saved_tensors
         assert do.is_contiguous()
         assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
         dq = torch.empty_like(q)
@@ -605,6 +766,9 @@ class _attention(torch.autograd.Function):
         _attn_bwd[grid](
             q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,  #
             M, delta,  #
+            freqs_cos, freqs_sin,  #
+            freqs_cos.stride(0),  #
+            freqs_cos.stride(1),  #
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
             N_HEAD, N_CTX,  #
             BLOCK_M1=BLOCK_M1, BLOCK_N1=BLOCK_N1,  #
@@ -616,7 +780,7 @@ class _attention(torch.autograd.Function):
             CAUSAL=ctx.causal,  #
         )
 
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None
 
 
 attention = _attention.apply
