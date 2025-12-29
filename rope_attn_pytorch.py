@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 
+@torch.compile
 def precompute_freqs_cis(dim, seq_len, theta, device='cuda'):
     """
     Precompute cos and sin values for RoPE
