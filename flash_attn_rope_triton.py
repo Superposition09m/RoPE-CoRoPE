@@ -49,8 +49,8 @@ def is_hopper():
 def _attn_fwd_inner(acc, l_i, m_i, q1_rot, q2_rot,  #
                     K, V,  #
                     freqs_cos_ptr, freqs_sin_ptr,  #
-                    stride_k_seq, stride_v_seq,  #
-                    freqs_cos_stride_seq, freqs_sin_stride_seq,  #
+                    stride_k_seq, stride_v_seq, stride_k_dim, stride_v_dim,  #
+                    stride_freqs_seq, stride_freqs_dim,  #
                     offset_y, dtype: tl.constexpr, start_m, qk_scale,  #
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
@@ -75,16 +75,16 @@ def _attn_fwd_inner(acc, l_i, m_i, q1_rot, q2_rot,  #
         offs_n_local = start_n + offs_n
         
         # -- 物理双指针加载 K (Scheme C) --
-        k1_ptrs = K + offs_n_local[:, None] * stride_k_seq + offs_d_first[None, :]
-        k2_ptrs = K + offs_n_local[:, None] * stride_k_seq + offs_d_second[None, :]
+        k1_ptrs = K + offs_n_local[:, None] * stride_k_seq + offs_d_first[None, :] * stride_k_dim
+        k2_ptrs = K + offs_n_local[:, None] * stride_k_seq + offs_d_second[None, :] * stride_k_dim
         
         mask_k = (offs_n_local[:, None] < N_CTX)
         k1 = tl.load(k1_ptrs, mask=mask_k, other=0.0)
         k2 = tl.load(k2_ptrs, mask=mask_k, other=0.0)
         
         # Load RoPE frequencies for K positions
-        freqs_cos_k_ptrs = freqs_cos_ptr + offs_n_local[:, None] * freqs_cos_stride_seq + offs_d_first[None, :]
-        freqs_sin_k_ptrs = freqs_sin_ptr + offs_n_local[:, None] * freqs_sin_stride_seq + offs_d_first[None, :]
+        freqs_cos_k_ptrs = freqs_cos_ptr + offs_n_local[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
+        freqs_sin_k_ptrs = freqs_sin_ptr + offs_n_local[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
         
         mask_k_half = (offs_n_local[:, None] < N_CTX)
         cos_k = tl.load(freqs_cos_k_ptrs, mask=mask_k_half, other=1.0).to(tl.float32)
@@ -110,18 +110,10 @@ def _attn_fwd_inner(acc, l_i, m_i, q1_rot, q2_rot,  #
         alpha = tl.math.exp2(m_i - m_ij)
         l_ij = tl.sum(p, 1)
         # -- update output accumulator --
-        if not IS_HOPPER and warp_specialize and BLOCK_M == 128 and HEAD_DIM == 128:
-            BM: tl.constexpr = acc.shape[0]
-            BN: tl.constexpr = acc.shape[1]
-            acc0, acc1 = acc.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
-            acc0 = acc0 * alpha[:, None]
-            acc1 = acc1 * alpha[:, None]
-            acc = tl.join(acc0, acc1).permute(0, 2, 1).reshape([BM, BN])
-        else:
-            acc = acc * alpha[:, None]
+        acc = acc * alpha[:, None]
             
         # -- 物理指针加载 V --
-        v_ptrs = V + offs_n_local[:, None] * stride_v_seq + tl.arange(0, HEAD_DIM)[None, :]
+        v_ptrs = V + offs_n_local[:, None] * stride_v_seq + tl.arange(0, HEAD_DIM)[None, :] * stride_v_dim
         v = tl.load(v_ptrs, mask=mask_k, other=0.0)
         
         p = p.to(dtype)
@@ -181,16 +173,16 @@ def _attn_fwd(sm_scale, M,  #
     offs_d_second = half_dim + tl.arange(0, half_dim)
 
     # -- 物理双指针加载 Q (Scheme C) --
-    q1_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d_first[None, :]
-    q2_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d_second[None, :]
+    q1_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d_first[None, :] * stride_qk
+    q2_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d_second[None, :] * stride_qk
     
     mask_q = (offs_m[:, None] < N_CTX)
     q1 = tl.load(q1_ptrs, mask=mask_q, other=0.0)
     q2 = tl.load(q2_ptrs, mask=mask_q, other=0.0)
 
     # Load cos/sin frequencies for Q
-    freqs_cos_q_ptrs = freqs_cos_ptr + offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :]
-    freqs_sin_q_ptrs = freqs_sin_ptr + offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :]
+    freqs_cos_q_ptrs = freqs_cos_ptr + offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
+    freqs_sin_q_ptrs = freqs_sin_ptr + offs_m[:, None] * stride_freqs_seq + offs_d_first[None, :] * stride_freqs_dim
     
     cos_half = tl.load(freqs_cos_q_ptrs, mask=mask_q, other=1.0).to(tl.float32)
     sin_half = tl.load(freqs_sin_q_ptrs, mask=mask_q, other=0.0).to(tl.float32)
@@ -204,8 +196,8 @@ def _attn_fwd(sm_scale, M,  #
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q1_rot, q2_rot,  #
                                         k_base, v_base,  #
                                         freqs_cos_ptr, freqs_sin_ptr,  #
-                                        stride_qm, stride_qm,  #
-                                        stride_freqs_seq, stride_freqs_seq,  #
+                                        stride_qm, stride_qm, stride_qk, stride_qk,  #
+                                        stride_freqs_seq, stride_freqs_dim,  #
                                         offset_y, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         4 - STAGE, offs_m, offs_n, N_CTX,  #
@@ -215,8 +207,8 @@ def _attn_fwd(sm_scale, M,  #
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q1_rot, q2_rot,  #
                                         k_base, v_base,  #
                                         freqs_cos_ptr, freqs_sin_ptr,  #
-                                        stride_qm, stride_qm,  #
-                                        stride_freqs_seq, stride_freqs_seq,  #
+                                        stride_qm, stride_qm, stride_qk, stride_qk,  #
+                                        stride_freqs_seq, stride_freqs_dim,  #
                                         offset_y, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         2, offs_m, offs_n, N_CTX,  #
@@ -228,7 +220,7 @@ def _attn_fwd(sm_scale, M,  #
     tl.store(m_ptrs, m_i)
     
     # -- 物理指针写回 O --
-    o_ptrs = o_base + offs_m[:, None] * stride_qm + tl.arange(0, HEAD_DIM)[None, :]
+    o_ptrs = o_base + offs_m[:, None] * stride_qm + tl.arange(0, HEAD_DIM)[None, :] * stride_qk
     tl.store(o_ptrs, acc.to(dtype), mask=mask_q)
 
 
