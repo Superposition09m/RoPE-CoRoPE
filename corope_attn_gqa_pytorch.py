@@ -113,14 +113,13 @@ class _attention_pytorch(torch.autograd.Function):
             v_expanded.to(torch.float32)
         ).to(q.dtype)
 
-        # Save for backward
-        if ctx is not None:
-            ctx.save_for_backward(q, k, v, attn_weights)
-            ctx.sm_scale = sm_scale
-            ctx.causal = causal
-            ctx.group_size = group_size
-            ctx.n_kv_heads = n_heads_kv
-            ctx.theta = theta
+
+        ctx.save_for_backward(q, k, v, attn_weights)
+        ctx.sm_scale = sm_scale
+        ctx.causal = causal
+        ctx.group_size = group_size
+        ctx.n_kv_heads = n_heads_kv
+        ctx.theta = theta
 
         return output
 
