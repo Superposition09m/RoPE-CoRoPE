@@ -108,9 +108,33 @@ class _attention_pytorch(torch.autograd.Function):
         q = apply_rotary_emb(q, freqs_cos, freqs_sin)
         k = apply_rotary_emb(k, freqs_cos, freqs_sin)
 
+        n_heads_q = q.shape[1]
+        n_heads_kv = k.shape[1]
+        if n_heads_q == n_heads_kv:
+            group_size = 1
+            k_expanded = k
+            v_expanded = v
+        else:
+            if n_heads_q % n_heads_kv != 0:
+                raise ValueError(
+                    f"Number of Q heads ({n_heads_q}) must be divisible by KV heads ({n_heads_kv})."
+                )
+            group_size = n_heads_q // n_heads_kv
+            B, _, N_CTX, HEAD_DIM = k.shape
+            k_expanded = k.view(B, n_heads_kv, 1, N_CTX, HEAD_DIM).expand(
+                B, n_heads_kv, group_size, N_CTX, HEAD_DIM
+            ).reshape(B, n_heads_q, N_CTX, HEAD_DIM)
+            v_expanded = v.view(B, n_heads_kv, 1, N_CTX, HEAD_DIM).expand(
+                B, n_heads_kv, group_size, N_CTX, HEAD_DIM
+            ).reshape(B, n_heads_q, N_CTX, HEAD_DIM)
+        
         # Compute attention scores: Q @ K^T * sm_scale
         # Use fp32 for dot product accumulation to avoid precision loss in long sequences
-        attn_scores = torch.einsum('bhqd,bhkd->bhqk', q.to(torch.float32), k.to(torch.float32)) * sm_scale
+        attn_scores = torch.einsum(
+            'bhqd,bhkd->bhqk',
+            q.to(torch.float32),
+            k_expanded.to(torch.float32)
+        ) * sm_scale
         
         # Apply causal mask if needed
         if causal:
@@ -152,12 +176,18 @@ class _attention_pytorch(torch.autograd.Function):
         
         # Attention output: attn_weights @ V
         # Use fp32 for weighted sum accumulation to avoid precision loss in long sequences
-        output = torch.einsum('bhqk,bhkd->bhqd', attn_weights.to(torch.float32), v.to(torch.float32)).to(q.dtype)
+        output = torch.einsum(
+            'bhqk,bhkd->bhqd',
+            attn_weights.to(torch.float32),
+            v_expanded.to(torch.float32)
+        ).to(q.dtype)
 
         # Save for backward
         ctx.save_for_backward(q, k, v, attn_weights, freqs_cos, freqs_sin)
         ctx.sm_scale = sm_scale
         ctx.causal = causal
+        ctx.group_size = group_size
+        ctx.n_kv_heads = n_heads_kv
 
         return output
     
@@ -176,6 +206,10 @@ class _attention_pytorch(torch.autograd.Function):
         q, k, v, attn_weights, freqs_cos, freqs_sin = ctx.saved_tensors
         sm_scale = ctx.sm_scale
         causal = ctx.causal
+        group_size = ctx.group_size
+        n_kv_heads = ctx.n_kv_heads
+        n_heads_q = q.shape[1]
+        B, _, N_CTX, HEAD_DIM = q.shape
         
         # Prepare causal mask if needed
         causal_mask = None
@@ -183,14 +217,29 @@ class _attention_pytorch(torch.autograd.Function):
             N_CTX = q.shape[2]
             mask = torch.triu(torch.ones(N_CTX, N_CTX, device=q.device, dtype=torch.bool), diagonal=1)
             causal_mask = mask.unsqueeze(0).unsqueeze(0)
+
+        if group_size == 1:
+            k_expanded_fp32 = k.to(torch.float32)
+            v_expanded_fp32 = v.to(torch.float32)
+        else:
+            k_expanded_fp32 = k.view(B, n_kv_heads, 1, N_CTX, HEAD_DIM).expand(
+                B, n_kv_heads, group_size, N_CTX, HEAD_DIM
+            ).reshape(B, n_heads_q, N_CTX, HEAD_DIM).to(torch.float32)
+            v_expanded_fp32 = v.view(B, n_kv_heads, 1, N_CTX, HEAD_DIM).expand(
+                B, n_kv_heads, group_size, N_CTX, HEAD_DIM
+            ).reshape(B, n_heads_q, N_CTX, HEAD_DIM).to(torch.float32)
         
         # Step 1: dV = attn_weights^T @ grad_output
         # Use fp32 for matrix multiplication accumulation
-        dv = torch.einsum('bhqk,bhqd->bhkd', attn_weights.to(torch.float32), grad_output.to(torch.float32)).to(grad_output.dtype)
+        dv_expanded = torch.einsum(
+            'bhqk,bhqd->bhkd',
+            attn_weights.to(torch.float32),
+            grad_output.to(torch.float32)
+        )
         
         # Step 2: dS = grad_output @ V^T (gradient w.r.t. attn_weights)
         # Use fp32 for matrix multiplication accumulation
-        ds = torch.einsum('bhqd,bhkd->bhqk', grad_output.to(torch.float32), v.to(torch.float32))
+        ds = torch.einsum('bhqd,bhkd->bhqk', grad_output.to(torch.float32), v_expanded_fp32)
         
         # Step 3: Softmax backward
         # Use fp32 for accumulation to avoid precision loss in mixed precision training
@@ -207,15 +256,21 @@ class _attention_pytorch(torch.autograd.Function):
         
         # Step 4: dQ = dp @ K * sm_scale
         # Use fp32 for matrix multiplication accumulation
-        dq = torch.einsum('bhqk,bhkd->bhqd', dp, k.to(torch.float32)) * sm_scale
+        dq = torch.einsum('bhqk,bhkd->bhqd', dp, k_expanded_fp32) * sm_scale
 
         # Step 5: dK = dp^T @ Q * sm_scale
         # Use fp32 for matrix multiplication accumulation
-        dk = torch.einsum('bhqk,bhqd->bhkd', dp, q.to(torch.float32)) * sm_scale
+        dk_expanded = torch.einsum('bhqk,bhqd->bhkd', dp, q.to(torch.float32)) * sm_scale
+        
+        if group_size == 1:
+            dv = dv_expanded.to(v.dtype)
+            dk = dk_expanded.to(k.dtype)
+        else:
+            dv = dv_expanded.view(B, n_kv_heads, group_size, N_CTX, HEAD_DIM).sum(dim=2).contiguous().to(v.dtype)
+            dk = dk_expanded.view(B, n_kv_heads, group_size, N_CTX, HEAD_DIM).sum(dim=2).contiguous().to(k.dtype)
         
         # Convert back to original dtype
         dq = dq.to(q.dtype)
-        dk = dk.to(k.dtype)
 
         # Apply inverse RoPE to gradients (use -freqs_sin for inverse rotation)
         dq = apply_rotary_emb(dq, freqs_cos, -freqs_sin)
@@ -225,4 +280,3 @@ class _attention_pytorch(torch.autograd.Function):
 
 
 attention_pytorch = _attention_pytorch.apply
-
