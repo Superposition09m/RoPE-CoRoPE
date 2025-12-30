@@ -67,23 +67,6 @@ def rotate_half(x):
     # Rotate: [-x2, x1]
     return torch.cat((-x2, x1), dim=-1)
 
-
-def apply_rotary_emb(x, freqs_cos, freqs_sin):
-    """
-    Apply rotary position embedding
-    Formula: x * cos(m*theta) + rotate_half(x) * sin(m*theta)
-
-    Args:
-        x: (BATCH, H, N_CTX, HEAD_DIM)
-        freqs_cos: (N_CTX, HEAD_DIM)
-        freqs_sin: (N_CTX, HEAD_DIM)
-
-    Returns:
-        rotated: (BATCH, H, N_CTX, HEAD_DIM)
-    """
-    return x * freqs_cos + rotate_half(x) * freqs_sin
-
-
 class _attention_pytorch(torch.autograd.Function):
     """
     Plain PyTorch Attention with manual backward pass
@@ -91,7 +74,7 @@ class _attention_pytorch(torch.autograd.Function):
     """
     
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, freqs_cos, freqs_sin):
+    def forward(ctx, q, k, v, causal, sm_scale, theta):
         """
         Args:
             q: (BATCH, H, N_CTX, HEAD_DIM)
@@ -99,16 +82,16 @@ class _attention_pytorch(torch.autograd.Function):
             v: (BATCH, H, N_CTX, HEAD_DIM)
             causal: bool
             sm_scale: float, scaling factor for attention scores
-            freqs_cos: (N_CTX, HEAD_DIM) - precomputed cos values for RoPE
-            freqs_sin: (N_CTX, HEAD_DIM) - precomputed sin values for RoPE
+            theta: float, RoPE base (e.g., 10000.0)
         Returns:
             output: (BATCH, H, N_CTX, HEAD_DIM)
         """
-        # Apply RoPE to Q and K (V does not need RoPE)
-        q = apply_rotary_emb(q, freqs_cos, freqs_sin)
-        k = apply_rotary_emb(k, freqs_cos, freqs_sin)
+        B, n_heads_q, N_CTX, HEAD_DIM = q.shape
+        device = q.device
 
-        n_heads_q = q.shape[1]
+        # Compute RoPE frequencies dynamically
+        inv_freq = 1.0 / (theta ** (torch.arange(0, HEAD_DIM, 2, device=device).float() / HEAD_DIM))
+
         n_heads_kv = k.shape[1]
         if n_heads_q == n_heads_kv:
             group_size = 1
@@ -128,13 +111,22 @@ class _attention_pytorch(torch.autograd.Function):
                 B, n_heads_kv, group_size, N_CTX, HEAD_DIM
             ).reshape(B, n_heads_q, N_CTX, HEAD_DIM)
         
+        z = torch.sigmoid(torch.einsum('bhqd,bhkd->bhqk', q, k_expanded) * sm_scale)
+        a = torch.cumsum(z, dim=-1)
+        delta_a = torch.diagonal(a, dim1=-2, dim2=-1).unsqueeze(-1) - a
+        
+        d_half = HEAD_DIM // 2
+        q1, q2 = q[..., :d_half], q[..., d_half:]
+        k1, k2 = k_expanded[..., :d_half], k_expanded[..., d_half:]
+        
+        E_A = q1.unsqueeze(3) * k1.unsqueeze(2) + q2.unsqueeze(3) * k2.unsqueeze(2)
+        E_B = q2.unsqueeze(3) * k1.unsqueeze(2) - q1.unsqueeze(3) * k2.unsqueeze(2)
+        
+        phi = delta_a.unsqueeze(-1) * inv_freq.view(1, 1, 1, 1, -1)
+        
         # Compute attention scores: Q @ K^T * sm_scale
         # Use fp32 for dot product accumulation to avoid precision loss in long sequences
-        attn_scores = torch.einsum(
-            'bhqd,bhkd->bhqk',
-            q.to(torch.float32),
-            k_expanded.to(torch.float32)
-        ) * sm_scale
+        attn_scores = (E_A * torch.cos(phi) - E_B * torch.sin(phi)).sum(dim=-1) * sm_scale
         
         # Apply causal mask if needed
         if causal:
@@ -183,13 +175,16 @@ class _attention_pytorch(torch.autograd.Function):
         ).to(q.dtype)
 
         # Save for backward
-        ctx.save_for_backward(q, k, v, attn_weights, freqs_cos, freqs_sin)
-        ctx.sm_scale = sm_scale
-        ctx.causal = causal
-        ctx.group_size = group_size
-        ctx.n_kv_heads = n_heads_kv
+        if ctx is not None:
+            ctx.save_for_backward(q, k, v, attn_weights)
+            ctx.sm_scale = sm_scale
+            ctx.causal = causal
+            ctx.group_size = group_size
+            ctx.n_kv_heads = n_heads_kv
+            ctx.theta = theta
 
         return output
+
     
     @staticmethod
     def backward(ctx, grad_output):
