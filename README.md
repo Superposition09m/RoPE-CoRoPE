@@ -13,41 +13,31 @@ Co-RoPE is a context-aware improvement of RoPE. In this project, we implement th
 
 ### Our Methodology
 
-![Methodology](./assets/method.png)
+Co-RoPE extends RoPE by introducing context-aware mileage computation. The key mathematical formulation is as follows:
 
-## Mathematical Formulation
+**Co-RoPE** 
 
-### Core Formula
+![CoRoPE1](./assets/corope-1.png)
 
-Co-RoPE extends RoPE by introducing context-aware mileage (里程) computation. The key mathematical formulation is as follows:
+For each query position $i$ and key position $j$, we compute the contextual mileage by summing up the sigmoid of the dot product between the query head and the key head:
 
-#### 1. Mileage Computation (里程计算)
+$$z_{ij} = \sigma(\mathbf{q}_i \cdot \mathbf{k}_j \cdot s)$$
 
-For each query position $i$ and key position $j$, we compute the contextual mileage:
-
-$$z_{ij} = \sigma(\mathbf{q}_i^{\text{leader}} \cdot \mathbf{k}_j \cdot s)$$
+and the accumulated mileage is:
 
 $$a_{ij} = \sum_{k=0}^{j} z_{ik}$$
 
-where $\sigma$ is the sigmoid function, $s$ is the scaling factor, and $\mathbf{q}^{\text{leader}}$ represents the leader query head (used for GQA efficiency).
-
-#### 2. Mileage Difference (里程差)
-
-The relative displacement between positions $i$ and $j$ is:
+where $\sigma$ is the sigmoid function, $s$ is the scaling factor, and $\mathbf{q}$ represents the query head. So the relative displacement between positions $i$ and $j$ is:
 
 $$\Delta a_{ij} = a_{ii} - a_{ij}$$
 
 This captures the contextual distance between query position $i$ and key position $j$.
-
-#### 3. Phase Modulation (相位调制)
 
 The phase angle is computed as:
 
 $$\phi_{ijd} = \Delta a_{ij} \cdot \omega_d$$
 
 where $\omega_d = \frac{1}{\theta^{2d/D}}$ is the inverse frequency for dimension $d$, and $\theta$ is the RoPE base (typically 10000).
-
-#### 4. Energy Field Decomposition (能量场分解)
 
 To efficiently apply the rotation, we decompose the query and key vectors into two halves:
 
@@ -59,31 +49,21 @@ $$E_A = \mathbf{q}_1 \mathbf{k}_1^T + \mathbf{q}_2 \mathbf{k}_2^T$$
 
 $$E_B = \mathbf{q}_2 \mathbf{k}_1^T - \mathbf{q}_1 \mathbf{k}_2^T$$
 
-#### 5. Attention Score (注意力分数)
-
 The final attention score combines the energy fields with phase modulation:
 
 $$\text{score}_{ij} = \sum_{d=0}^{D/2-1} \left[ E_A^{ijd} \cos(\phi_{ijd}) - E_B^{ijd} \sin(\phi_{ijd}) \right] \cdot s$$
 
-### Energy Simplification
+This simplifies...
 
-The key optimization in Co-RoPE is the **energy field decomposition**:
+**CoRoPE-GQA**
 
-- **Traditional approach**: Directly compute rotated Q and K, then perform matrix multiplication
-- **Co-RoPE approach**: Pre-compute energy fields $E_A$ and $E_B$ from unrotated Q and K, then apply rotation via simple trigonometric operations
+we use GQA to implement the Co-RoPE, to reduce the computational cost of the Co-RoPE.
 
-This simplification:
-1. **Reduces computation**: Energy fields are computed once and reused across different phase angles
-2. **Improves numerical stability**: Separates the dot product computation from rotation
-3. **Enables efficient implementation**: Allows for better memory access patterns in Triton kernels
+![Methodology](./assets/method.png)
 
-The mathematical equivalence can be verified by expanding the rotated dot product:
 
-$$\text{Re}(\mathbf{q}_\text{rot} \cdot \mathbf{k}_\text{rot}^*) = E_A \cos(\phi) - E_B \sin(\phi)$$
+We use a leader head to compute the contextual mileage and the accumulated mileage, and then broadcast the mileage to all the heads in the group.
 
-where $\mathbf{q}_\text{rot}$ and $\mathbf{k}_\text{rot}$ are the RoPE-rotated vectors, and $*$ denotes complex conjugation.
-
-- we use GQA to implement the Co-RoPE.
 
 
 
