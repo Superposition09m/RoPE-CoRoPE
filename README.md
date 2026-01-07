@@ -1,40 +1,72 @@
-# Co-RoPE
-## Methodology
+# Co-RoPE: Contextual Rotary Positional Encoding
 
-Collaborative Rotary Positional Embedding (Co-RoPE) is a content-aware dynamic positional encoding mechanism. Unlike standard RoPE which uses fixed token indices to represent relative distances, Co-RoPE determines the distance between tokens based on their mutual affinity, allowing the model to dynamically "compress" or "expand" the positional space.
+Co-RoPE is a context-aware improvement of RoPE. In this project, we implement the Co-RoPE in Triton and compare the performance with the PyTorch implementation.
 
-### 1. Leader-Driven GQA Mechanism
-To maintain computational efficiency, especially in Grouped Query Attention (GQA) settings, Co-RoPE introduces a **Leader-Driven** architecture:
-- **Leader Selection**: For each group of query heads (sharing the same KV heads), the first head is designated as the **Leader**.
-- **Shared Odometry**: The Leader head computes a shared "mileage" (odometry) distribution for the entire group. This reduces the overhead of dynamic position calculation from $O(H_q)$ to $O(H_{kv})$.
+## Preliminaries
 
-### 2. Dynamic Mileage (Odometry) Calculation
-The "mileage" $a_{i,j}$ represents the cumulative affinity a query at position $i$ has encountered when scanning keys from $0$ to $j$:
-1. **Affinity Score**: $z_{i,j} = \sigma(\tau \cdot \langle q_i, k_j \rangle)$, where $\sigma$ is the sigmoid function and $\rho$ is the softmax scaling factor (usually $1/\sqrt{d}$).
-2. **Cumulative Mileage**: $a_{i,j} = \sum_{k=0}^{j} z_{i,k}$.
-3. **Self-Mileage**: The total "distance" traveled by query $i$ up to its own position is $a_{i,i}$.
+- RoPE: https://arxiv.org/abs/2104.09864
 
-### 3. Co-RoPE Phase Shift
-The relative distance between query $i$ and key $j$ is defined as the mileage difference:
-$$\Delta a_{i,j} = a_{i,i} - a_{i,j}$$
-This dynamic distance replaces the static integer distance $(i - j)$ in the RoPE formulation. The attention score is computed as:
-$$\text{Score}(i, j) = \langle R(\Delta a_{i,j}) q_i, k_j \rangle$$
-where $R(\theta)$ is the rotary matrix. In practice, this is equivalent to:
-$$\text{Score}(i, j) = \langle R(a_{i,i}) q_i, R(a_{i,j}) k_j \rangle$$
-This literal interpretation allows each token to perceive its neighbors at distances proportional to their semantic relevance.
 
-### 4. Energy Field Decomposition (EA-EB Optimization)
-To avoid the $O(N^2 \cdot D)$ overhead of explicitly materializing rotated tensors or high-dimensional rotary matrices, we use the **Energy Field Decomposition**:
-The rotary dot product can be expanded using trigonometric identities:
-$$\text{Score}(i, j) = \sum_{d=0}^{D/2-1} \left[ (q_{2d}k_{2d} + q_{2d+1}k_{2d+1}) \cos(\Delta a_{i,j} \omega_d) - (q_{2d+1}k_{2d} - q_{2d}k_{2d+1}) \sin(\Delta a_{i,j} \omega_d) \right]$$
+- CoPE: https://arxiv.org/abs/2405.18719
 
-We define two "Energy Fields" $E_A$ and $E_B$:
-- **Real Energy ($E_A$)**: $q_{2d}k_{2d} + q_{2d+1}k_{2d+1}$ (The standard dot product components)
-- **Imaginary Energy ($E_B$)**: $q_{2d+1}k_{2d} - q_{2d}k_{2d+1}$ (The rotational interaction components)
+![CoRoPE](./assets/corope.png)
 
-Final computation:
-$$\text{Score}(i, j) = \sum \left( E_A \circ \cos(\phi) - E_B \circ \sin(\phi) \right)$$
-This decomposition is critical for the Triton implementation, as it allows us to compute the attention score in a single pass without redundant rotations, significantly improving memory throughput and compute utilization.
+### Our Methodology
+
+Co-RoPE extends RoPE by introducing context-aware mileage computation. The key mathematical formulation is as follows:
+
+**Co-RoPE** 
+
+![CoRoPE1](./assets/corope-1.png)
+
+For each query position $i$ and key position $j$, we compute the contextual mileage by summing up the sigmoid of the dot product between the query head and the key head:
+
+$$z_{ij} = \sigma(\mathbf{q}_i \cdot \mathbf{k}_j \cdot s)$$
+
+and the accumulated mileage is:
+
+$$a_{ij} = \sum_{k=0}^{j} z_{ik}$$
+
+where $\sigma$ is the sigmoid function, $s$ is the scaling factor, and $\mathbf{q}$ represents the query head. So the relative displacement between positions $i$ and $j$ is:
+
+$$\Delta a_{ij} = a_{ii} - a_{ij}$$
+
+This captures the contextual distance between query position $i$ and key position $j$.
+
+The phase angle is computed as:
+
+$$\phi_{ijd} = \Delta a_{ij} \cdot \omega_d$$
+
+where $\omega_d = \frac{1}{\theta^{2d/D}}$ is the inverse frequency for dimension $d$, and $\theta$ is the RoPE base (typically 10000).
+
+To efficiently apply the rotation, we decompose the query and key vectors into two halves:
+
+$$\mathbf{q} = [\mathbf{q}_1, \mathbf{q}_2], \quad \mathbf{k} = [\mathbf{k}_1, \mathbf{k}_2]$$
+
+The energy fields are computed as:
+
+$$E_A = \mathbf{q}_1 \mathbf{k}_1^T + \mathbf{q}_2 \mathbf{k}_2^T$$
+
+$$E_B = \mathbf{q}_2 \mathbf{k}_1^T - \mathbf{q}_1 \mathbf{k}_2^T$$
+
+The final attention score combines the energy fields with phase modulation:
+
+$$\text{score}_{ij} = \sum_{d=0}^{D/2-1} \left[ E_A^{ijd} \cos(\phi_{ijd}) - E_B^{ijd} \sin(\phi_{ijd}) \right] \cdot s$$
+
+This simplifies...
+
+**CoRoPE-GQA**
+
+we use GQA to implement the Co-RoPE, to reduce the computational cost of the Co-RoPE.
+
+![Methodology](./assets/method.png)
+
+
+We use a leader head to compute the contextual mileage and the accumulated mileage, and then broadcast the mileage to all the heads in the group.
+
+
+
+
 
 ## Environment:
 ```
