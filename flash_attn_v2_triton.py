@@ -177,7 +177,7 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
                  prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
 def _attn_fwd(sm_scale, M,  #
-              Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
+              Z, H_Q, H_KV, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
               HEAD_DIM: tl.constexpr,  #
               BLOCK_M: tl.constexpr,  #
               BLOCK_N: tl.constexpr,  #
@@ -185,31 +185,35 @@ def _attn_fwd(sm_scale, M,  #
               STAGE: tl.constexpr,  #
               warp_specialize: tl.constexpr,  #
               IS_HOPPER: tl.constexpr,  #
+              GROUP_SIZE: tl.constexpr,  #
               ):
     dtype = tl.float8e5 if FP8_OUTPUT else tl.float16
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
-    off_z = off_hz // H
-    off_h = off_hz % H
+    off_z = off_hz // H_Q
+    off_h_q = off_hz % H_Q
+    off_h_kv = off_h_q // GROUP_SIZE
 
-    y_dim = Z * H * N_CTX
-    desc_q = _maybe_make_tensor_desc(desc_q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+    y_dim_q = Z * H_Q * N_CTX
+    y_dim_kv = Z * H_KV * N_CTX
+    desc_q = _maybe_make_tensor_desc(desc_q, shape=[y_dim_q, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_M, HEAD_DIM])
     if FP8_OUTPUT:
-        desc_v = _maybe_make_tensor_desc(desc_v, shape=[HEAD_DIM, y_dim], strides=[N_CTX, 1],
+        desc_v = _maybe_make_tensor_desc(desc_v, shape=[HEAD_DIM, y_dim_kv], strides=[N_CTX, 1],
                                          block_shape=[HEAD_DIM, BLOCK_N])
     else:
-        
-        desc_v = _maybe_make_tensor_desc(desc_v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+
+        desc_v = _maybe_make_tensor_desc(desc_v, shape=[y_dim_kv, HEAD_DIM], strides=[HEAD_DIM, 1],
                                          block_shape=[BLOCK_N, HEAD_DIM])
-    desc_k = _maybe_make_tensor_desc(desc_k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+    desc_k = _maybe_make_tensor_desc(desc_k, shape=[y_dim_kv, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_N, HEAD_DIM])
-    desc_o = _maybe_make_tensor_desc(desc_o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+    desc_o = _maybe_make_tensor_desc(desc_o, shape=[y_dim_q, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_M, HEAD_DIM])
 
-    offset_y = off_z * (N_CTX * H) + off_h * N_CTX
-    qo_offset_y = offset_y + start_m * BLOCK_M
+    offset_kv_y = off_z * (N_CTX * H_KV) + off_h_kv * N_CTX
+    offset_q_y = off_z * (N_CTX * H_Q) + off_h_q * N_CTX
+    qo_offset_y = offset_q_y + start_m * BLOCK_M
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -228,7 +232,7 @@ def _attn_fwd(sm_scale, M,  #
     if STAGE & 1:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,  #
                                         desc_k, desc_v,  #
-                                        offset_y, dtype, start_m, qk_scale,  #
+                                        offset_kv_y, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         4 - STAGE, offs_m, offs_n, N_CTX,  #
                                         warp_specialize, IS_HOPPER)
@@ -236,7 +240,7 @@ def _attn_fwd(sm_scale, M,  #
     if STAGE & 2:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,  #
                                         desc_k, desc_v,  #
-                                        offset_y, dtype, start_m, qk_scale,  #
+                                        offset_kv_y, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         2, offs_m, offs_n, N_CTX,  #
                                         warp_specialize, IS_HOPPER)
@@ -513,6 +517,9 @@ class _attention(torch.autograd.Function):
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
+        H_Q = q.shape[1]
+        H_KV = k.shape[1]
+        GROUP_SIZE = H_Q // H_KV
         o = torch.empty_like(q)
         stage = 3 if causal else 1
         extra_kern_args = {}
@@ -521,22 +528,23 @@ class _attention(torch.autograd.Function):
             waves_per_eu = 3 if HEAD_DIM_K <= 64 else 2
             extra_kern_args = {"waves_per_eu": waves_per_eu, "allow_flush_denorm": True}
 
-        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+        M = torch.empty((q.shape[0], H_Q, q.shape[2]), device=q.device, dtype=torch.float32)
         # Use device_descriptor for Hopper + warpspec.
         if supports_host_descriptor() and not (is_hopper() and warp_specialize):
             # Note that on Hopper we cannot perform a FP8 dot with a non-transposed second tensor
-            y_dim = q.shape[0] * q.shape[1] * q.shape[2]
+            y_dim_q = q.shape[0] * H_Q * q.shape[2]
+            y_dim_kv = q.shape[0] * H_KV * q.shape[2]
 
             dummy_block = [1, 1]
-            desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+            desc_q = TensorDescriptor(q, shape=[y_dim_q, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
             if q.dtype == torch.float8_e5m2:
-                desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, y_dim], strides=[q.shape[2], 1],
+                desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, y_dim_kv], strides=[q.shape[2], 1],
                                           block_shape=dummy_block)
             else:
-                desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
+                desc_v = TensorDescriptor(v, shape=[y_dim_kv, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
                                           block_shape=dummy_block)
-            desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-            desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+            desc_k = TensorDescriptor(k, shape=[y_dim_kv, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+            desc_o = TensorDescriptor(o, shape=[y_dim_q, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
         else:
             desc_q = q
             desc_v = v
@@ -549,7 +557,7 @@ class _attention(torch.autograd.Function):
         triton.set_allocator(alloc_fn)
 
         def grid(META):
-            return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
+            return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * H_Q, 1)
 
         ctx.grid = grid
         if is_blackwell() and warp_specialize:
@@ -559,7 +567,7 @@ class _attention(torch.autograd.Function):
                 extra_kern_args["maxnreg"] = 80
         _attn_fwd[grid](
             sm_scale, M,  #
-            q.shape[0], q.shape[1],  #
+            q.shape[0], H_Q, H_KV,  #
             desc_q, desc_k, desc_v, desc_o,  #
             N_CTX=q.shape[2],  #
             HEAD_DIM=HEAD_DIM_K,  #
@@ -567,6 +575,7 @@ class _attention(torch.autograd.Function):
             STAGE=stage,  #
             warp_specialize=warp_specialize,  #
             IS_HOPPER=is_hopper(),  #
+            GROUP_SIZE=GROUP_SIZE,  #
             **extra_kern_args)
 
         ctx.save_for_backward(q, k, v, o, M)
