@@ -75,11 +75,11 @@ o = flash_attn(q_rope, k_rope, v)  # Read from HBM
 **Our Fused Implementation (1 kernel)**:
 
 ```python
-# In _attn_fwd (outer loop, line 266-267):
+# In _attn_fwd (outer loop):
 q1_rot = (q1 * cos_q - q2 * sin_q).to(q1.dtype)  # Compute once per query block
 q2_rot = (q2 * cos_q + q1 * sin_q).to(q2.dtype)
 
-# In _attn_fwd_inner (inner loop, line 75-97):
+# In _attn_fwd_inner (inner loop):
 for start_n in tl.range(lo, hi, BLOCK_N):
     # Load K block
     k1 = tl.load(k1_ptrs, mask=mask_k, other=0.0)
