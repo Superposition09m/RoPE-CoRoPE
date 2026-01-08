@@ -171,23 +171,6 @@ $$\phi_{ijd} = \Delta a_{ij} \cdot \omega_d$$
 
 where $\omega_d = \frac{1}{\theta^{2d/D}}$ is the inverse frequency for dimension $d$, and $\theta$ is the RoPE base (typically 10000).
 
-
-**Efficient Rotation**
-
-To efficiently apply the rotation, we decompose the query and key vectors into two halves:
-
-$$\mathbf{q} = [\mathbf{q}_1, \mathbf{q}_2], \quad \mathbf{k} = [\mathbf{k}_1, \mathbf{k}_2]$$
-
-The energy fields are computed as:
-
-$$E_A = \mathbf{q}_1 \mathbf{k}_1^T + \mathbf{q}_2 \mathbf{k}_2^T$$
-
-$$E_B = \mathbf{q}_2 \mathbf{k}_1^T - \mathbf{q}_1 \mathbf{k}_2^T$$
-
-The final attention score combines the energy fields with phase modulation:
-
-$$\text{score}_{ij} = \sum_{d=0}^{D/2-1} \left[ E_A^{ijd} \cos(\phi_{ijd}) - E_B^{ijd} \sin(\phi_{ijd}) \right] \cdot s$$
-
 **CoRoPE-GQA**
 
 We use GQA to implement Co-RoPE to reduce the computational cost.
