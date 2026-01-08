@@ -78,6 +78,13 @@ def _attn_fwd_inner(acc, l_i, m_i,  #
         mask_k = offs_n_curr[:, None] < N_CTX
         mask_k = mask_k & (offs_d_first[None, :] >= 0)
 
+        # Load K first (before freqs to optimize memory access pattern)
+        k1_ptrs = k_ptr + offs_n_curr[:, None] * stride_k_tok + offs_d_first[None, :] * stride_k_dim
+        k2_ptrs = k_ptr + offs_n_curr[:, None] * stride_k_tok + offs_d_second[None, :] * stride_k_dim
+        k1 = tl.load(k1_ptrs, mask=mask_k, other=0.0)
+        k2 = tl.load(k2_ptrs, mask=mask_k, other=0.0)
+
+        # Load freqs
         freqs_cos_ptrs = freqs_cos_ptr + offs_n_curr[:, None] * stride_freqs_seq + \
             offs_d_first[None, :] * stride_freqs_dim
         freqs_sin_ptrs = freqs_sin_ptr + offs_n_curr[:, None] * stride_freqs_seq + \
@@ -85,13 +92,11 @@ def _attn_fwd_inner(acc, l_i, m_i,  #
         cos_k = tl.load(freqs_cos_ptrs, mask=mask_k, other=1.0).to(tl.float32)
         sin_k = tl.load(freqs_sin_ptrs, mask=mask_k, other=0.0).to(tl.float32)
 
-        k1_ptrs = k_ptr + offs_n_curr[:, None] * stride_k_tok + offs_d_first[None, :] * stride_k_dim
-        k2_ptrs = k_ptr + offs_n_curr[:, None] * stride_k_tok + offs_d_second[None, :] * stride_k_dim
-        k1 = tl.load(k1_ptrs, mask=mask_k, other=0.0)
-        k2 = tl.load(k2_ptrs, mask=mask_k, other=0.0)
-
-        k1_rot = (k1.to(tl.float32) * cos_k - k2.to(tl.float32) * sin_k).to(q1_rot.dtype)
-        k2_rot = (k2.to(tl.float32) * cos_k + k1.to(tl.float32) * sin_k).to(q2_rot.dtype)
+        # In-place rotation: overwrite k1, k2 immediately to save registers
+        k1_f32 = k1.to(tl.float32)
+        k2_f32 = k2.to(tl.float32)
+        k1_rot = (k1_f32 * cos_k - k2_f32 * sin_k).to(q1_rot.dtype)
+        k2_rot = (k2_f32 * cos_k + k1_f32 * sin_k).to(q2_rot.dtype)
 
         qk = tl.dot(q1_rot, tl.trans(k1_rot))
         qk += tl.dot(q2_rot, tl.trans(k2_rot))
@@ -162,6 +167,21 @@ configs = [
     for s in NUM_STAGES_OPTIONS \
     for w in [4, 8]\
 ]
+
+# 为长序列添加优化配置：小 tile + 更多 stages + 更少 warps
+# 目标：降低寄存器压力，增加 occupancy，更好地 overlap 计算和内存访问
+configs += [
+    # 小 tile 配置（BLOCK_M=32）- 降低寄存器使用
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_stages=5, num_warps=4, pre_hook=_host_descriptor_pre_hook),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_stages=5, num_warps=4, pre_hook=_host_descriptor_pre_hook),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=5, num_warps=4, pre_hook=_host_descriptor_pre_hook),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_stages=4, num_warps=4, pre_hook=_host_descriptor_pre_hook),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_stages=4, num_warps=4, pre_hook=_host_descriptor_pre_hook),
+    # 更少 warps（占用更少寄存器，允许更多 blocks 同时运行）
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=4, num_warps=2, pre_hook=_host_descriptor_pre_hook),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=4, num_warps=2, pre_hook=_host_descriptor_pre_hook),
+]
+
 if "PYTEST_VERSION" in os.environ:
     # Use a single config in testing for reproducibility
     configs = [
@@ -182,21 +202,10 @@ def prune_invalid_configs(configs, named_args, **kwargs):
 
     # Filter out configs where BLOCK_M > N_CTX
     # Filter out configs where BLOCK_M < BLOCK_N when causal is True
-    filtered = [
+    return [
         conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX and (
             conf.kwargs.get("BLOCK_M", 0) >= conf.kwargs.get("BLOCK_N", 0) or STAGE == 1)
     ]
-    
-    # 长序列优化：使用小 tile 降低寄存器压力，提高 occupancy
-    if N_CTX >= 8192:
-        # 过滤掉大 tile，只保留 BLOCK_M <= 64 and BLOCK_N <= 64
-        filtered = [
-            conf for conf in filtered
-            if conf.kwargs.get("BLOCK_M", 0) <= 64 
-            and conf.kwargs.get("BLOCK_N", 0) <= 64
-        ]
-    
-    return filtered
 
 
 @triton.jit
@@ -722,9 +731,18 @@ class _attention(torch.autograd.Function):
         dv = torch.empty_like(v)
         BATCH, N_HEAD, N_CTX = q.shape[:3]
         PRE_BLOCK = 128
-        NUM_WARPS, NUM_STAGES = 4, 5
-        BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
-        BLK_SLICE_FACTOR = 2
+        
+        # 为长序列优化 backward 配置
+        if N_CTX >= 8192:
+            # 长序列：使用更小的 block 和更多 stages
+            NUM_WARPS, NUM_STAGES = 4, 6
+            BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 64, 64, 32
+            BLK_SLICE_FACTOR = 2
+        else:
+            # 短序列：使用标准配置
+            NUM_WARPS, NUM_STAGES = 4, 5
+            BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
+            BLK_SLICE_FACTOR = 2
         RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
         arg_k = k
         arg_k = arg_k * (ctx.sm_scale * RCP_LN2)
